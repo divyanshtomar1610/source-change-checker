@@ -37,7 +37,7 @@ To watch your own sources, copy `sources.example.json` to `sources.json` and edi
 | `kind` | `rss`, `atom`, `hash` (an undated page) or `linkedin_eng_html` (see Limits) |
 | `platform` | Label for the Platform column. With the value `Meta`, the label is refined from the item title (Instagram, Threads, LinkedIn or Facebook) |
 | `official` | `true` shows as OFFICIAL, `false` as THIRD-PARTY |
-| `hosts` | Host names the final URL may land on after redirects |
+| `hosts` | Host names the source may be served from. A redirect to any other host is refused before it is followed |
 | `baseline_hash` | `hash` sources only: the 16-character hash to compare against |
 | `reddit` | Optional. `true` spaces requests to these sources 21 seconds apart |
 
@@ -84,6 +84,8 @@ To set a hash baseline for a new `hash` source, run once without `baseline_hash`
 - Items with no readable date are skipped and counted as undated. Dates are compared as each publisher wrote them, with no time zone conversion.
 - You are responsible for the terms of use and robots rules of the sites you fetch. The script sends a generic User-Agent and no contact details.
 - Tested on Python 3.9 and 3.14 on macOS only.
+- Redirects are followed only to the hosts you list for a source, and only over http or https. A response over 5 MB, or XML that declares entities, is a failure.
+- The path check works on whole segments: a source at `/blog` may land on `/blog/2026/post`, never on `/blog-login`.
 
 ## Licence
 

@@ -5,9 +5,10 @@ Deterministic and standard library only. No language model is called.
 
 What it does, per source:
   * fetch with a 12-second timeout, no retry, a plain generic User-Agent;
-  * follow redirects and record the final URL;
-  * FAIL if the final URL lands on an unexpected host or outside the expected path
-    (soft-404 / login-wall guard);
+  * follow redirects only to the hosts you listed for that source, and record the
+    final URL;
+  * FAIL if a redirect points at an unexpected host, or the final URL lands outside
+    the expected path (soft-404 / login-wall guard);
   * dated sources (RSS, Atom, one HTML blog index): parse dated items, FAIL when
     zero dated items parse (the "silent zero" guard), keep items dated on or after
     --since, tag each one rule-relevant or not with a fixed keyword list;
@@ -42,9 +43,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 
 USER_AGENT = "Mozilla/5.0 (compatible; source-change-checker/1.0)"
 TIMEOUT_SECONDS = 12
+MAX_BYTES = 5_000_000  # a larger response is a failure, not something to parse
 REDDIT_GAP_SECONDS = 21
 MIN_HASH_TEXT_CHARS = 1000
 
@@ -134,16 +137,47 @@ class SourceFailure(Exception):
 
 
 class _EntityGuard:
-    """Refuse XML with entity declarations (entity-expansion guard)."""
+    """Refuse XML that declares entities (entity-expansion guard).
+
+    The check is done by the XML parser itself, not by searching the bytes, so it
+    holds whatever encoding the document declares (UTF-16 included).
+    """
 
     @staticmethod
     def check(body):
-        if re.search(rb"<!ENTITY", body, re.I):
+        def refuse(*_args):
             raise SourceFailure("XML declares entities; refused")
 
+        probe = xml.parsers.expat.ParserCreate()
+        probe.EntityDeclHandler = refuse
+        try:
+            probe.Parse(body, True)
+        except xml.parsers.expat.ExpatError:
+            pass  # malformed XML is reported by the real parse that follows
 
-def fetch(url):
-    """GET with redirects followed. Returns (status, final_url, body_bytes)."""
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """Check every redirect hop BEFORE it is requested: http(s) only, expected hosts only."""
+
+    def __init__(self, hosts):
+        self.hosts = hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(newurl)
+        if target.scheme not in ("http", "https"):
+            raise SourceFailure(f"redirect to a non-web address refused ({newurl})")
+        if target.hostname not in self.hosts:
+            raise SourceFailure(
+                f"redirect to host '{target.hostname}' refused, expected {self.hosts} (redirect target {newurl})"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch(url, hosts):
+    """GET, following redirects only to expected hosts. Returns (status, final_url, body_bytes)."""
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise SourceFailure(f"only http and https URLs are fetched ({url})")
+    opener = urllib.request.build_opener(_GuardedRedirect(hosts))
     req = urllib.request.Request(
         url,
         headers={
@@ -152,8 +186,11 @@ def fetch(url):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-            return resp.status, resp.geturl(), resp.read()
+        with opener.open(req, timeout=TIMEOUT_SECONDS) as resp:
+            body = resp.read(MAX_BYTES + 1)
+            if len(body) > MAX_BYTES:
+                raise SourceFailure(f"response is larger than {MAX_BYTES} bytes; refused")
+            return resp.status, resp.geturl(), body
     except urllib.error.HTTPError as e:
         final = e.geturl() or url
         if e.code == 429:
@@ -167,6 +204,10 @@ def fetch(url):
         raise SourceFailure(f"network error: {e}")
 
 
+def _norm_path(path):
+    return re.sub(r"/{2,}", "/", urllib.parse.unquote(path)).rstrip("/")
+
+
 def check_final_url(src, requested_url, final_url):
     req = urllib.parse.urlsplit(requested_url)
     fin = urllib.parse.urlsplit(final_url)
@@ -174,8 +215,9 @@ def check_final_url(src, requested_url, final_url):
         raise SourceFailure(
             f"final URL host '{fin.hostname}' is not expected {src['hosts']} (final URL {final_url})"
         )
-    want = req.path.rstrip("/")
-    if not fin.path.rstrip("/").startswith(want):
+    want, got = _norm_path(req.path), _norm_path(fin.path)
+    # Whole path segments only: /blog must not accept /blog-login or /blogs.
+    if not (got == want or got.startswith(want + "/")):
         raise SourceFailure(
             f"final URL path '{fin.path}' left the expected path '{req.path}' (soft-404 or login wall? final URL {final_url})"
         )
@@ -324,7 +366,7 @@ def run_source(src, since, reddit_clock):
                 time.sleep(wait)
     try:
         try:
-            status, final_url, body = fetch(url)
+            status, final_url, body = fetch(url, src["hosts"])
         finally:
             if src.get("reddit"):
                 reddit_clock["last"] = time.monotonic()
