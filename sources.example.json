@@ -6,17 +6,14 @@
       "name": "GitHub changelog (RSS feed)",
       "url": "https://github.blog/changelog/feed/",
       "kind": "rss",
-      "platform": "GitHub",
-      "official": true,
-      "hosts": ["github.blog"]
+      "hosts": ["github.blog"],
+      "keywords": ["Actions", "Copilot", "deprecat"]
     },
     {
       "id": "cpython-releases",
       "name": "CPython releases (Atom feed)",
       "url": "https://github.com/python/cpython/releases.atom",
       "kind": "atom",
-      "platform": "Python",
-      "official": true,
       "hosts": ["github.com"]
     },
     {
@@ -24,8 +21,6 @@
       "name": "GitHub Terms of Service (hash watch)",
       "url": "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service",
       "kind": "hash",
-      "platform": "GitHub",
-      "official": true,
       "hosts": ["docs.github.com"]
     }
   ]

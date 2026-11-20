@@ -4,19 +4,20 @@
 Deterministic and standard library only. No language model is called.
 
 What it does, per source:
-  * fetch with a 12-second timeout, no retry, a plain generic User-Agent;
+  * fetch with a 12-second total time limit, no retry, a plain generic User-Agent;
   * follow redirects only to the hosts you listed for that source, and record the
     final URL;
   * FAIL if a redirect points at an unexpected host, or the final URL lands outside
     the expected path (soft-404 / login-wall guard);
-  * dated sources (RSS, Atom, one HTML blog index): parse dated items, FAIL when
-    zero dated items parse (the "silent zero" guard), keep items dated on or after
-    --since, tag each one rule-relevant or not with a fixed keyword list;
+  * dated sources (RSS, Atom): parse dated items, FAIL when zero dated items parse
+    (the "silent zero" guard), keep items dated on or after --since, and tag each
+    one that matches the optional keyword list of its source;
   * hash sources (undated pages): hash the extracted main text, FAIL when the text
     is missing or too short, report CHANGED when the hash differs from the
     baseline.
 
-Reddit requests are spaced 20+ seconds apart. A 429 is a source failure, never
+A source marked "throttle": true is fetched at least 21 seconds after the previous
+throttled source, for sites that rate-limit. A 429 is a source failure, never
 "no news". No personal data is sent in any header.
 
 The source list is a JSON file. By default the script reads sources.json next to
@@ -46,15 +47,15 @@ import xml.etree.ElementTree as ET
 import xml.parsers.expat
 
 USER_AGENT = "Mozilla/5.0 (compatible; source-change-checker/1.0)"
-TIMEOUT_SECONDS = 12
-MAX_BYTES = 5_000_000  # a larger response is a failure, not something to parse
-REDDIT_GAP_SECONDS = 21
+TIMEOUT_SECONDS = 12          # total time for one fetch, connect and read included
+MAX_BYTES = 5_000_000         # a larger response is a failure, not something to parse
+THROTTLE_GAP_SECONDS = 21
 MIN_HASH_TEXT_CHARS = 1000
 
 # The source list lives in a JSON file so you can edit it without touching the code.
 # See sources.example.json for the format and README.md for what each field means.
-VALID_KINDS = ("rss", "atom", "linkedin_eng_html", "hash")
-REQUIRED_KEYS = ("id", "name", "url", "kind", "platform", "official", "hosts")
+VALID_KINDS = ("rss", "atom", "hash")
+REQUIRED_KEYS = ("id", "name", "url", "kind", "hosts")
 
 
 def default_sources_path():
@@ -82,54 +83,35 @@ def load_sources(path):
         missing = [k for k in REQUIRED_KEYS if k not in s]
         if missing:
             raise ValueError(f"source {n} ({s.get('id', 'no id')}) is missing: {', '.join(missing)}")
+        sid = s["id"]
+        for k in ("id", "name", "url", "kind"):
+            if not isinstance(s[k], str) or not s[k].strip():
+                raise ValueError(f"source {n} ({sid}): '{k}' must be a non-empty string")
         if s["kind"] not in VALID_KINDS:
-            raise ValueError(f"source '{s['id']}' has kind '{s['kind']}'; use one of {', '.join(VALID_KINDS)}")
-        if not isinstance(s["hosts"], list) or not s["hosts"]:
-            raise ValueError(f"source '{s['id']}' needs a non-empty 'hosts' list")
-        if s["id"] in seen:
-            raise ValueError(f"source id '{s['id']}' is used twice")
-        seen.add(s["id"])
+            raise ValueError(f"source '{sid}' has kind '{s['kind']}'; use one of {', '.join(VALID_KINDS)}")
+        if urllib.parse.urlsplit(s["url"]).scheme not in ("http", "https"):
+            raise ValueError(f"source '{sid}': url must start with http:// or https://")
+        hosts = s["hosts"]
+        if not isinstance(hosts, list) or not hosts or not all(isinstance(h, str) and h for h in hosts):
+            raise ValueError(f"source '{sid}' needs a non-empty 'hosts' list of host names")
+        s["hosts"] = [h.lower() for h in hosts]
+        if "keywords" in s:
+            kw = s["keywords"]
+            if not isinstance(kw, list) or not all(isinstance(k, str) and k.strip() for k in kw):
+                raise ValueError(f"source '{sid}': 'keywords' must be a list of words or phrases")
+        if "throttle" in s and not isinstance(s["throttle"], bool):
+            raise ValueError(f"source '{sid}': 'throttle' must be true or false")
+        if "baseline_hash" in s and not isinstance(s["baseline_hash"], str):
+            raise ValueError(f"source '{sid}': 'baseline_hash' must be a string")
+        if sid in seen:
+            raise ValueError(f"source id '{sid}' is used twice")
+        seen.add(sid)
     return sources
 
 
-# EXAMPLE keyword list: edit it for the topic you watch. An item that matches any
-# term is tagged rule-relevant. Each entry is (label, regular expression). Keep the
-# patterns word-bounded so that "link" does not match "LinkedIn" and "feed" does
-# not match "feedback".
-RULE_TERMS = [
-    ("algorithm", r"\balgorithm\w*"),
-    ("feed", r"\bfeeds?\b"),
-    ("reach", r"\breach\b"),
-    ("ranking", r"\brank(?:s|ed|ing)?\b"),
-    ("distribution", r"\bdistribut\w*"),
-    ("recommend", r"\brecommend\w*"),
-    ("slop", r"\bslop\b"),
-    ("AI-generated", r"\bAI[- ]generated\b"),
-    ("engagement bait", r"\bengagement[- ]bait\w*"),
-    ("comment", r"\bcomments?\b"),
-    ("link", r"\blinks?\b"),
-    ("carousel", r"\bcarousels?\b"),
-    ("document", r"\bdocuments?\b"),
-    ("dwell", r"\bdwell\w*"),
-    ("hashtag", r"\bhashtags?\b"),
-    ("poll", r"\bpolls?\b"),
-    ("creator", r"\bcreators?\b"),
-    ("creator analytics", r"\bcreator analytics\b"),
-    ("saves", r"\bsaves\b"),
-    ("sends", r"\bsends\b"),
-    ("originality", r"\boriginal(?:ity| content)\b"),
-    ("aggregator", r"\baggregat\w*"),
-    ("policy", r"\bpolic(?:y|ies)\b"),
-    ("reels", r"\breels?\b"),
-]
-RULE_RES = [(label, re.compile(rx, re.I)) for label, rx in RULE_TERMS]
-
-PLATFORM_HINTS = [
-    ("Instagram", re.compile(r"\binstagram\b|\breels?\b", re.I)),
-    ("Threads", re.compile(r"\bthreads\b", re.I)),
-    ("LinkedIn", re.compile(r"\blinkedin\b", re.I)),
-    ("Facebook", re.compile(r"\bfacebook\b", re.I)),
-]
+def keyword_patterns(src):
+    """Word-bounded, case-insensitive patterns for the source's optional keyword list."""
+    return [(k, re.compile(r"(?<!\w)" + re.escape(k) + r"(?!\w)", re.I)) for k in src.get("keywords", [])]
 
 
 class SourceFailure(Exception):
@@ -166,7 +148,7 @@ class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
         target = urllib.parse.urlsplit(newurl)
         if target.scheme not in ("http", "https"):
             raise SourceFailure(f"redirect to a non-web address refused ({newurl})")
-        if target.hostname not in self.hosts:
+        if (target.hostname or "").lower() not in self.hosts:
             raise SourceFailure(
                 f"redirect to host '{target.hostname}' refused, expected {self.hosts} (redirect target {newurl})"
             )
@@ -174,7 +156,11 @@ class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def fetch(url, hosts):
-    """GET, following redirects only to expected hosts. Returns (status, final_url, body_bytes)."""
+    """GET, following redirects only to expected hosts. Returns (status, final_url, body_bytes).
+
+    The time limit covers the whole fetch: a server that trickles one byte at a time
+    cannot keep the run alive past TIMEOUT_SECONDS.
+    """
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         raise SourceFailure(f"only http and https URLs are fetched ({url})")
     opener = urllib.request.build_opener(_GuardedRedirect(hosts))
@@ -185,12 +171,21 @@ def fetch(url, hosts):
             "Accept": "application/rss+xml, application/atom+xml, application/xml, text/html;q=0.9, */*;q=0.5",
         },
     )
+    deadline = time.monotonic() + TIMEOUT_SECONDS
     try:
         with opener.open(req, timeout=TIMEOUT_SECONDS) as resp:
-            body = resp.read(MAX_BYTES + 1)
-            if len(body) > MAX_BYTES:
-                raise SourceFailure(f"response is larger than {MAX_BYTES} bytes; refused")
-            return resp.status, resp.geturl(), body
+            chunks, size = [], 0
+            while True:
+                if time.monotonic() > deadline:
+                    raise SourceFailure(f"timeout after {TIMEOUT_SECONDS}s (slow response)")
+                chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise SourceFailure(f"response is larger than {MAX_BYTES} bytes; refused")
+                chunks.append(chunk)
+            return resp.status, resp.geturl(), b"".join(chunks)
     except urllib.error.HTTPError as e:
         final = e.geturl() or url
         if e.code == 429:
@@ -211,7 +206,7 @@ def _norm_path(path):
 def check_final_url(src, requested_url, final_url):
     req = urllib.parse.urlsplit(requested_url)
     fin = urllib.parse.urlsplit(final_url)
-    if fin.hostname not in src["hosts"]:
+    if (fin.hostname or "").lower() not in src["hosts"]:
         raise SourceFailure(
             f"final URL host '{fin.hostname}' is not expected {src['hosts']} (final URL {final_url})"
         )
@@ -228,6 +223,35 @@ def strip_tags(text):
     text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
     text = re.sub(r"<[^>]+>", " ", text)
     return " ".join(html.unescape(text).split())
+
+
+def clean_title(text):
+    """Feed titles are text, not markup: unescape once, then drop any tags that remain."""
+    return strip_tags(html.unescape(text))
+
+
+def parse_iso_date(raw):
+    """ISO 8601 as feeds write it, on Python 3.9 as well as 3.11+.
+
+    Accepts a trailing Z or z, +hhmm without a colon, and fractional seconds of any
+    length. Returns None when the text is not a date.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    s = re.sub(r"[zZ]$", "+00:00", s)
+    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
+    s = re.sub(r"(\.\d{1,6})\d+", r"\1", s)
+    s = re.sub(r"\.(\d{1,5})(?=[+-]|$)", lambda m: "." + m.group(1).ljust(6, "0"), s)
+    try:
+        return dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _as_utc(when):
+    """Naive dates are treated as UTC, so items from one feed always compare."""
+    return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
 
 
 def _local(tag):
@@ -254,22 +278,26 @@ def parse_rss(body):
         if _local(it.tag) != "item":
             continue
         title = _child_text(it, "title")
-        link = _child_text(it, "link")
+        # Prefer the plain RSS <link> over a namespaced one such as <atom:link rel="self">.
+        link = ""
+        for c in it:
+            if c.tag == "link":
+                link = (c.text or "").strip()
+                break
+        if not link:
+            link = _child_text(it, "link")
         raw_date = _child_text(it, "pubDate") or _child_text(it, "date")
         when = None
         if raw_date:
             try:
                 when = email.utils.parsedate_to_datetime(raw_date)
-            except (TypeError, ValueError):
-                try:
-                    when = dt.datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                except ValueError:
-                    when = None
+            except (TypeError, ValueError, IndexError):
+                when = parse_iso_date(raw_date)
         if when is None:
             undated += 1
             continue
         summary = strip_tags(_child_text(it, "description"))[:600]
-        items.append({"title": strip_tags(title), "url": link, "when": when, "summary": summary})
+        items.append({"title": clean_title(title), "url": link, "when": _as_utc(when), "summary": summary})
     return items, undated
 
 
@@ -292,41 +320,12 @@ def parse_atom(body):
                 link = c.get("href", "")
                 break
         raw_date = _child_text(en, "published") or _child_text(en, "updated")
-        try:
-            when = dt.datetime.fromisoformat(raw_date.replace("Z", "+00:00")) if raw_date else None
-        except ValueError:
-            when = None
+        when = parse_iso_date(raw_date) if raw_date else None
         if when is None:
             undated += 1
             continue
         summary = strip_tags(_child_text(en, "content") or _child_text(en, "summary"))[:600]
-        items.append({"title": strip_tags(title), "url": link, "when": when, "summary": summary})
-    return items, undated
-
-
-ENG_ITEM_RE = re.compile(r'<li class="post-list__item[^"]*">(.*?)</li>', re.S)
-ENG_LINK_RE = re.compile(r'<a class="grid-post__link[^"]*" href="([^"]+)">(.*?)</a>', re.S)
-ENG_DATE_RE = re.compile(r'<p class="grid-post__date[^"]*">\s*([A-Z][a-z]{2} \d{1,2}, \d{4})\s*</p>')
-
-
-def parse_linkedin_eng(body):
-    text = body.decode("utf-8", "replace")
-    items, undated = [], 0
-    seen = set()
-    for block in ENG_ITEM_RE.findall(text):
-        lm = ENG_LINK_RE.search(block)
-        dm = ENG_DATE_RE.search(block)
-        if not lm:
-            continue
-        url = html.unescape(lm.group(1))
-        if url in seen:
-            continue
-        seen.add(url)
-        if not dm:
-            undated += 1
-            continue
-        when = dt.datetime.strptime(dm.group(1), "%b %d, %Y")
-        items.append({"title": strip_tags(lm.group(2)), "url": url, "when": when, "summary": ""})
+        items.append({"title": clean_title(title), "url": link, "when": _as_utc(when), "summary": summary})
     return items, undated
 
 
@@ -338,38 +337,29 @@ def extract_main_text(body):
     return strip_tags(m.group(0))
 
 
-def tag_item(item, src):
+def tag_item(item, patterns):
     hay = f"{item['title']} {item['summary']}"
-    matched = [label for label, rx in RULE_RES if rx.search(hay)]
-    platform = src["platform"]
-    if platform == "Meta":
-        hits = [p for p, rx in PLATFORM_HINTS if rx.search(item["title"])]
-        platform = "/".join(hits) if hits else "Meta"
-    return {
-        **item,
-        "platform": platform,
-        "official": "OFFICIAL" if src["official"] else "THIRD-PARTY",
-        "rule_relevant": bool(matched),
-        "terms": matched,
-    }
+    matched = [label for label, rx in patterns if rx.search(hay)]
+    return {**item, "keyword_match": bool(matched), "terms": matched}
 
 
-def run_source(src, since, reddit_clock):
+def run_source(src, since, throttle_clock):
     res = {"src": src, "status": "OK", "http": None, "final_url": None, "error": None,
            "parsed": 0, "undated": 0, "newest": None, "items": [], "hash": None, "hash_state": None}
     url = src["url"]
-    if src.get("reddit"):
-        last = reddit_clock.get("last")
+    throttled = bool(src.get("throttle"))
+    if throttled:
+        last = throttle_clock.get("last")
         if last is not None:
-            wait = REDDIT_GAP_SECONDS - (time.monotonic() - last)
+            wait = THROTTLE_GAP_SECONDS - (time.monotonic() - last)
             if wait > 0:
                 time.sleep(wait)
     try:
         try:
             status, final_url, body = fetch(url, src["hosts"])
         finally:
-            if src.get("reddit"):
-                reddit_clock["last"] = time.monotonic()
+            if throttled:
+                throttle_clock["last"] = time.monotonic()
         res["http"], res["final_url"] = status, final_url
         check_final_url(src, url, final_url)
         if src["kind"] == "hash":
@@ -382,7 +372,7 @@ def run_source(src, since, reddit_clock):
             base = src.get("baseline_hash")
             res["hash_state"] = "UNCHANGED" if digest == base else f"CHANGED (baseline {base})"
             return res
-        parser = {"rss": parse_rss, "atom": parse_atom, "linkedin_eng_html": parse_linkedin_eng}[src["kind"]]
+        parser = {"rss": parse_rss, "atom": parse_atom}[src["kind"]]
         items, undated = parser(body)
         res["parsed"], res["undated"] = len(items), undated
         if not items:
@@ -390,7 +380,8 @@ def run_source(src, since, reddit_clock):
                 f"answered HTTP {status} but parsed ZERO dated items ({undated} undated) - format change or soft-404"
             )
         res["newest"] = max(i["when"] for i in items).date()
-        kept = [tag_item(i, src) for i in items if i["when"].date() >= since]
+        patterns = keyword_patterns(src)
+        kept = [tag_item(i, patterns) for i in items if i["when"].date() >= since]
         kept.sort(key=lambda i: i["when"], reverse=True)
         res["items"] = kept
     except SourceFailure as e:
@@ -404,26 +395,29 @@ def md_escape(s):
     return s.replace("|", "\\|").replace("\n", " ")
 
 
+def md_url(u):
+    return u.replace("|", "%7C").replace(")", "%29").replace(" ", "%20")
+
+
 def render(results, since, started, sources_file):
     failed = [r for r in results if r["status"] == "FAILED"]
     changed = [r for r in results if r["hash_state"] and r["hash_state"].startswith("CHANGED")]
     all_items = [i for r in results for i in r["items"]]
-    relevant = [i for i in all_items if i["rule_relevant"]]
+    matched = [i for i in all_items if i["keyword_match"]]
     out = []
     out.append(f"# Source change check: since {since.isoformat()}")
     out.append("")
     out.append(f"- Run started: {started.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    out.append(f"- Script: `check_sources.py` (no model call, fixed keyword tags); sources file: `{sources_file}`")
+    out.append(f"- Script: `check_sources.py` (no model call); sources file: `{sources_file}`")
     out.append(f"- Sources: {len(results)}; OK {len(results) - len(failed)}; **FAILED {len(failed)}**")
-    out.append(f"- Items since {since.isoformat()}: {len(all_items)}; rule-relevant: {len(relevant)}; "
-               f"official and rule-relevant: {sum(1 for i in relevant if i['official'] == 'OFFICIAL')}")
+    out.append(f"- Items since {since.isoformat()}: {len(all_items)}; keyword matches: {len(matched)}")
     out.append(f"- Watched-page hash changes: {len(changed)}")
     out.append("")
     if failed:
         out.append("## !!! SOURCE FAILURES - this run is NOT a quiet day !!!")
         out.append("")
         for r in failed:
-            out.append(f"- **FAILED `{r['src']['id']}`** ({r['src']['name']}): {md_escape(r['error'])}")
+            out.append(f"- **FAILED `{r['src']['id']}`** ({md_escape(r['src']['name'])}): {md_escape(r['error'])}")
         out.append("")
     if changed:
         out.append("## Watched page CHANGED")
@@ -445,21 +439,20 @@ def render(results, since, started, sources_file):
             newest = r["newest"].isoformat() if r["newest"] else "-"
             since_n = str(len(r["items"]))
         out.append(f"| `{s['id']}` {md_escape(s['name'])} | **{r['status']}** | {r['http'] or '-'} | "
-                   f"{r['final_url'] or s['url']} | {parsed} | {newest} | {since_n} |")
+                   f"{md_escape(r['final_url'] or s['url'])} | {parsed} | {newest} | {since_n} |")
     out.append("")
     out.append(f"## Items since {since.isoformat()}")
     out.append("")
     if not all_items:
         out.append("No new dated items in the window.")
     else:
-        out.append("| Date | Source | Platform | Type | Rule-relevant | Matched terms | Title |")
-        out.append("|---|---|---|---|---|---|---|")
+        out.append("| Date | Source | Keyword match | Matched terms | Title |")
+        out.append("|---|---|---|---|---|")
         for r in results:
             for i in r["items"]:
-                rr = "**YES**" if i["rule_relevant"] else "no"
-                out.append(f"| {i['when'].date().isoformat()} | `{r['src']['id']}` | {i['platform']} | "
-                           f"{i['official']} | {rr} | {', '.join(i['terms']) or '-'} | "
-                           f"[{md_escape(i['title'])}]({i['url']}) |")
+                km = "**YES**" if i["keyword_match"] else "no"
+                out.append(f"| {i['when'].date().isoformat()} | `{r['src']['id']}` | {km} | "
+                           f"{', '.join(i['terms']) or '-'} | [{md_escape(i['title'])}]({md_url(i['url'])}) |")
     out.append("")
     out.append(f"Exit status: {'1 (one or more sources FAILED)' if failed else '0 (all sources OK)'}")
     out.append("")
@@ -503,21 +496,31 @@ def main(argv=None):
             ap.error(f"bad --override '{ov}' (ids: {', '.join(by_id)})")
         by_id[sid]["url"] = url
         by_id[sid]["name"] += " [URL OVERRIDDEN]"
-    if a.only:
+    if a.only is not None:
         wanted = [x.strip() for x in a.only.split(",") if x.strip()]
+        if not wanted:
+            ap.error("--only needs at least one source id")
         unknown = [w for w in wanted if w not in by_id]
         if unknown:
             ap.error(f"unknown --only ids: {unknown}")
         sources = [by_id[w] for w in wanted]
+    if a.out:
+        out_dir = os.path.dirname(os.path.abspath(a.out))
+        if not os.path.isdir(out_dir):
+            ap.error(f"--out folder does not exist: {out_dir}")
 
     started = dt.datetime.now(dt.timezone.utc).astimezone()
-    reddit_clock = {}
-    results = [run_source(s, since, reddit_clock) for s in sources]
+    throttle_clock = {}
+    results = [run_source(s, since, throttle_clock) for s in sources]
     report = render(results, since, started, os.path.basename(sources_path))
     sys.stdout.write(report)
     if a.out:
-        with open(a.out, "w", encoding="utf-8") as fh:
-            fh.write(report)
+        try:
+            with open(a.out, "w", encoding="utf-8") as fh:
+                fh.write(report)
+        except OSError as e:
+            print(f"cannot write --out file '{a.out}': {e.strerror or e}", file=sys.stderr)
+            return 2
     failed = [r for r in results if r["status"] == "FAILED"]
     for r in failed:
         print(f"SOURCE FAILED: {r['src']['id']}: {r['error']}", file=sys.stderr)
