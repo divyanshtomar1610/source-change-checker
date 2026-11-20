@@ -1,0 +1,32 @@
+{
+  "_readme": "EXAMPLE source list. Copy this file to sources.json and replace the entries with the pages and feeds you want to watch. Field meanings are in README.md.",
+  "sources": [
+    {
+      "id": "github-changelog",
+      "name": "GitHub changelog (RSS feed)",
+      "url": "https://github.blog/changelog/feed/",
+      "kind": "rss",
+      "platform": "GitHub",
+      "official": true,
+      "hosts": ["github.blog"]
+    },
+    {
+      "id": "cpython-releases",
+      "name": "CPython releases (Atom feed)",
+      "url": "https://github.com/python/cpython/releases.atom",
+      "kind": "atom",
+      "platform": "Python",
+      "official": true,
+      "hosts": ["github.com"]
+    },
+    {
+      "id": "github-terms",
+      "name": "GitHub Terms of Service (hash watch)",
+      "url": "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service",
+      "kind": "hash",
+      "platform": "GitHub",
+      "official": true,
+      "hosts": ["docs.github.com"]
+    }
+  ]
+}
